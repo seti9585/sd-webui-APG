@@ -273,7 +273,8 @@ def _apg_update(
 # reForge pre-CFG args dict keys used here:
 #   "conds_out"  — [cond, uncond] denoised predictions (uncond may be absent
 #                  or all-zero when CFG == 1)
-#   "cond_scale" — CFG scale (logged for the first-step quirk check)
+#   "cond_scale" — CFG scale (not needed by the write-back; it is
+#                  scale-independent)
 #   "sigma"      — timestep tensor (used for the momentum reset guard)
 # ---------------------------------------------------------------------------
 
@@ -285,7 +286,7 @@ def _make_apg_pre_fn(eta: float, norm_threshold: float, momentum: float):
     cond + (cond_scale - 1) * update for any cond_scale.
     """
     buffer = MomentumBuffer(momentum)
-    state = {"prev_sigma": None, "calls": 0}
+    state = {"prev_sigma": None}
 
     @torch.no_grad()
     def _fn(args):
@@ -301,18 +302,6 @@ def _make_apg_pre_fn(eta: float, norm_threshold: float, momentum: float):
             if state["prev_sigma"] is not None and sigma > state["prev_sigma"]:
                 buffer.reset()
             state["prev_sigma"] = sigma
-
-            state["calls"] += 1
-            if state["calls"] <= 4:
-                # First-step cond_scale verification: Forge Classic has been
-                # observed to pass cond_scale == 1.0 on the first step (see
-                # Shiba-2-shiba's APGForge workaround). The write-back trick
-                # is cond_scale-independent, so no override is needed here;
-                # this log exists to confirm whether reForge shares the quirk.
-                logger.debug(
-                    "[APG] pre-CFG call #%d: sigma=%.4f cond_scale=%s",
-                    state["calls"], sigma, args.get("cond_scale"),
-                )
 
             cond = conds_out[0]
             uncond = conds_out[1]
@@ -348,7 +337,7 @@ def _make_apg_post_fn(eta: float, norm_threshold: float, momentum: float):
     args["denoised"] unchanged.
     """
     buffer = MomentumBuffer(momentum)
-    state = {"prev_sigma": None, "calls": 0}
+    state = {"prev_sigma": None}
 
     @torch.no_grad()
     def _fn(args):
@@ -363,13 +352,6 @@ def _make_apg_post_fn(eta: float, norm_threshold: float, momentum: float):
             state["prev_sigma"] = sigma
 
             cond_scale = args["cond_scale"]
-
-            state["calls"] += 1
-            if state["calls"] <= 4:
-                logger.debug(
-                    "[APG] post-CFG call #%d: sigma=%.4f cond_scale=%s",
-                    state["calls"], sigma, cond_scale,
-                )
 
             cond = args["cond_denoised"]
             tcfg_uncond = _stashed_tcfg_uncond(args)
