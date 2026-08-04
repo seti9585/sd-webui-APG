@@ -21,8 +21,8 @@ from the ComfyUI built-in node.
 
 Defaults follow the paper: eta = 0.0 (recommended default), norm_threshold =
 15.0 (Table 10, SDXL row), momentum = 0.0 (Algorithm 1 default; the momentum
-buffer carries state across model evaluations and therefore interacts with
-multi-stage / adaptive ODE samplers -- see core.py).
+buffer carries state across model evaluations and is not recommended with
+high-order solvers -- see core.py).
 
 Neutral settings that reproduce standard CFG exactly (fixed-seed A/B
 baseline): eta = 1.0, norm_threshold = 0.0, momentum = 0.0.
@@ -119,9 +119,11 @@ class APGScript(scripts.Script):
                 "<p style='color:gray;font-size:0.9em;'>"
                 "Neutral settings (identical to standard CFG): Eta 1.0, "
                 "Norm Threshold 0, Momentum 0. Momentum accumulates across "
-                "model evaluations, so its effect depends on the sampler "
-                "(multi-stage / adaptive solvers update it more often per "
-                "step); it is OFF by default."
+                "model evaluations and therefore breaks the stateless "
+                "assumption of ODE samplers: with multi-stage or adaptive "
+                "solvers (TDE Sampler / RK Sampler, Heun, DPM++ 2M/3M) the "
+                "value no longer maps to the result in a predictable way. "
+                "Not recommended above single-stage samplers; OFF by default."
                 "</p>"
             )
 
@@ -133,7 +135,9 @@ class APGScript(scripts.Script):
         # active, so its presence means ON, absence OFF; Enable therefore
         # binds to a callable that forces OFF when the key is absent. The
         # other keys use plain strings (absent keys leave the component
-        # untouched).
+        # untouched). Infotext produced by older releases may still carry an
+        # "APG Adaptive Momentum" key; no component binds to it any more, so
+        # it is simply ignored on read.
         self.infotext_fields = [
             (enabled,        lambda d: "APG Eta" in d),
             (eta,            "APG Eta"),
