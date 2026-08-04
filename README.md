@@ -2,12 +2,28 @@
 
 **EN** | [日本語](#日本語)
 
-Pre-CFG guidance extension for Stable Diffusion WebUI (Forge-based).
-Decomposes the CFG guidance vector into components parallel and orthogonal to the conditional prediction, then down-weights the parallel component — the main source of oversaturation and artifacts at high guidance scales.
+Adaptive Projected Guidance (APG) extension for Stable Diffusion WebUI (Forge-based).
 
-Paper: [arXiv:2410.02416](https://arxiv.org/abs/2410.02416) (ICLR 2025) — "Eliminating Oversaturation and Artifacts of High Guidance Scales in Diffusion Models"
+Implementation of [**Eliminating Oversaturation and Artifacts of High Guidance Scales in Diffusion Models**](https://arxiv.org/abs/2410.02416) (ICLR 2025), Algorithm 1.
 
-> When `Eta = 1`, `Norm Threshold = 0`, `Momentum = 0`, the result is identical to standard CFG.
+> APG reduces the oversaturation and artifacts that appear at high CFG scales,
+> letting you raise CFG for stronger prompt adherence without the usual
+> color burn and contrast blowout.
+
+---
+
+## Features
+
+- **Paper formulation**, not the ComfyUI node formulation — the neutral
+  settings reproduce standard CFG **exactly** (verified by fixed-seed
+  pixel-level A/B comparison).
+- Works on **reForge / Forge Classic** (Pre-CFG hook) and **Forge Neo**
+  (Post-CFG hook); the backend is detected automatically.
+- Rank-agnostic projection — supports both 4-D SDXL latents and 5-D
+  Anima / NextDiT latents.
+- Composes with the rest of the guidance suite via `sorting_priority`.
+- XYZ Grid axes for all parameters.
+- Generation parameters are embedded in PNG infotext for reproducibility.
 
 ---
 
@@ -19,127 +35,199 @@ Paper: [arXiv:2410.02416](https://arxiv.org/abs/2410.02416) (ICLR 2025) — "Eli
 https://github.com/seti9585/sd-webui-APG
 ```
 
+> This extension relies on the Forge backend hook API.
+> It is not available in A1111 (AUTOMATIC1111).
+
+---
+
+## How it works
+
+APG decomposes the guidance vector into a component parallel to the
+conditional prediction and a component orthogonal to it. The parallel
+component is what pushes the latent along the direction it is already
+heading — the main cause of oversaturation at high CFG. Scaling it down
+keeps the semantic steering (orthogonal part) while removing the burn.
+
+```
+diff      = cond - uncond
+diff      = momentum_buffer.update(diff)      (optional, beta != 0)
+diff      = clamp L2 norm to norm_threshold   (optional, threshold > 0)
+par, orth = project diff onto cond
+update    = orth + eta * par
+final     = cond + (cond_scale - 1) * update
+```
+
 ---
 
 ## Parameters
 
-| Parameter | Default | Description |
-| --------- | ------- | ----------- |
-| Eta            | 0.00 | Fraction of the parallel component kept. `0` removes it entirely (paper-recommended default, strongest de-saturation). `1` keeps it fully, which makes the projection an identity operation. |
-| Norm Threshold | 15.0 | Per-sample L2 clamp on the guidance vector. `0` disables the clamp. The paper's Stable Diffusion XL setting is `15` (Table 10). |
-| Momentum       | 0.00 | Coefficient of the running average of the guidance vector across model evaluations. `0` disables it (default). The paper's experiments use negative values such as `-0.5`. **Off by default — see the note below.** |
+| Control | Range | Default | Description |
+|---|---|---|---|
+| **Enable APG** | — | Off | Master switch. |
+| **Eta** | 0.0 – 2.0 | 0.0 | How much of the parallel component to keep. `0` is the paper's recommended default; `1.0` keeps it fully, which disables the projection. Raise it if the result looks flat or desaturated. |
+| **Norm Threshold** | 0.0 – 50.0 | 15.0 | Per-sample L2 clamp on the guidance vector. `0` disables. The paper uses `15` for SDXL. |
+| **Momentum** | -1.5 – 1.0 | 0.0 | Running-average coefficient (beta). `0` disables. The paper uses negative values such as `-0.5`. **See the warning below before enabling.** |
 
-Eta is the primary control. Raising it from 0 adds saturation back; lowering Norm Threshold below the guidance norm begins to cap single-step magnitude; Momentum smooths abrupt evaluation-to-evaluation changes but interacts with the sampler (see below).
-
-### Suggested starting points (APG alone)
-
-Based on an Eta sweep at CFG 7 (SDXL-family, TDE Sampler `euler`, AYS, single-variable A/B):
-
-- Most of Eta's visible effect is concentrated in the `0.0 → 0.1` range; `0.2` adds a little more, and `0.3` and above show diminishing returns. This matches the linear form `update = orthogonal + Eta × parallel`.
-- A practical everyday starting point is **Eta 0.2 / Norm Threshold 15 / Momentum 0** (saturation restored, safe). Lower Eta toward `0.1` for a more restrained, higher-contrast look.
-- At the CFG 7 tested here the guidance norm rarely exceeds 15, so Norm Threshold is effectively an inert safety valve; drop it toward `10` only when you specifically want to cap single-step magnitude. At much higher CFG the clamp becomes active and its effect grows.
-
----
-
-## Momentum and ODE samplers
-
-Momentum keeps a running average of the guidance vector **across model evaluations**, not across visible sampling steps. This carried state is why it is disabled by default:
-
-- The convergence order of Runge–Kutta and adaptive-step solvers assumes the right-hand side depends only on `(x, sigma)`. Eta and Norm Threshold are stateless per-evaluation transforms and preserve that assumption; Momentum does not.
-- A multi-stage solver such as RK Sampler `fe_kutta4` evaluates four stages per step, so the running average updates four times per step, decaying older contributions faster than a one-evaluation-per-step solver would. The same Momentum value therefore behaves differently across samplers.
-- Adaptive-step solvers reject and re-try steps; the rejected evaluations still accumulate, and a re-try at a temporarily larger sigma also trips the sigma-increase reset. Both make the effective Momentum depend on the tolerance settings.
-
-If you use Momentum, prefer a one-evaluation-per-step fixed-step solver (e.g. `fe_euler1`, `euler`) and a value near `-0.5`. Otherwise leave it at `0`, where APG is a pure stateless per-evaluation transform.
-
----
-
-## Algorithm
+### Neutral settings
 
 ```
-diff       = cond − uncond                          # denoised (x0) space
-diff       = momentum_buffer.update(diff)           # optional (Momentum ≠ 0)
-diff       = diff × min(1, norm_threshold / ‖diff‖) # optional (Norm Threshold > 0)
-parallel   = project diff onto cond
-orthogonal = diff − parallel
-update     = orthogonal + Eta × parallel
-output     = cond + (cfg_scale − 1) × update
+Eta 1.0 / Norm Threshold 0 / Momentum 0
 ```
 
-Norm and projection reductions run over all non-batch dimensions (per sample). Projection is computed in double precision, then cast back.
+These reproduce standard CFG bit-for-bit. Use them as the A/B baseline when
+measuring what APG actually changes.
 
-When `Eta = 1`, `Norm Threshold = 0`, `Momentum = 0`, `update = diff = cond − uncond` and the output reduces to `uncond + cfg_scale × (cond − uncond)` — bit-for-bit standard CFG. This makes a clean fixed-seed A/B baseline.
+### Suggested starting points
 
-### Differences from the ComfyUI built-in APG node
+| Situation | Eta | Norm Threshold | Momentum |
+|---|---|---|---|
+| Paper default (single extension, high CFG) | 0.0 | 15.0 | 0.0 |
+| Result looks washed out or low-contrast | 0.3 – 0.7 | 15.0 | 0.0 |
+| **Stacking with other guidance extensions** | 1.0 | 0.0 | 0.0 |
 
-This port follows the paper's Algorithm 1, and two choices differ from ComfyUI's `comfy_extras/nodes_apg.py`:
-
-- **Final combination.** This extension uses `cond + (cfg_scale − 1) × update`, matching the paper. The ComfyUI node effectively yields `cond + cfg_scale × update`, one guidance unit stronger, so its neutral settings do not reduce to standard CFG. The paper form is used here specifically so the neutral A/B baseline holds.
-- **Reduction dimensions.** Norm and projection reduce over all non-batch dimensions (`range(1, ndim)`) instead of a fixed `dim=[-1,-2,-3]`. For 4-D SDXL latents `(B, C, H, W)` this is identical to the paper. For 5-D latents `(B, C, T, H, W)` it keeps the paper's per-sample semantics instead of silently becoming per-channel. HuggingFace diffusers' `AdaptiveProjectedGuidance` makes the same choice.
-
----
-
-## Backend-adaptive hooking
-
-| Backend | Hook | Mechanism |
-| ------- | ---- | --------- |
-| reForge / Forge Classic | Pre-CFG | The uncond slot of `conds_out` is overwritten with `cond − update`. The backend's standard CFG step then produces `cond + (cfg_scale − 1) × update` for any CFG scale — the write-back itself is scale-independent. |
-| Forge Neo | Post-CFG | Forge Neo's pre-CFG runs before model evaluation, so predictions are not available there. The final prediction is recomputed directly as `cond + (cfg_scale − 1) × update`, priority-ordered in the post-CFG list. |
-
-A fresh momentum buffer is created for every sampling pass (txt2img and Hires.fix get independent state), with a secondary reset when sigma increases between calls.
-
-On reForge, the first-step `cond_scale` was verified to equal the configured CFG value (no `cond_scale = 1.0` first-step quirk); the write-back is scale-independent regardless.
+When APG runs on top of TCFG / SkimmedCFG / DifferenceCFG and others, the
+paper defaults are usually too strong: each extension in the chain is already
+reducing the guidance magnitude. Start from the neutral settings and lower
+Eta gradually from there.
 
 ---
 
-## Compatibility with other extensions
+## ⚠ Momentum and high-order solvers
 
-APG (Pre-CFG, `sorting_priority = 14.5`) sits at the end of the pre-CFG chain, just before the CFG core:
+**Momentum is not recommended with multi-stage or adaptive ODE solvers.**
+
+The momentum buffer keeps a running average **across model evaluations**, so
+the integrand is no longer a function of `(x, sigma)` alone. This breaks the
+stateless right-hand-side assumption that ODE solvers rely on:
+
+- Multi-stage methods evaluate the model several times per step
+  (`kutta4` = 4 evaluations), so the buffer accumulates several times faster
+  than it does with a single-stage method at the same step count.
+- Adaptive step control re-evaluates rejected steps, making the accumulation
+  rate depend on the tolerance settings.
+
+Fixed-seed measurements (SDXL, 35 steps, Align Your Steps, CFG 7) showed that
+this is not simply a matter of scaling the coefficient. With a 4-stage solver,
+changing a momentum-related parameter by a very small amount moved the result
+about as far as it was from the baseline in the first place — the output
+jumped to an unrelated solution instead of changing proportionally. With a
+single-stage solver the same change produced roughly half the displacement,
+but the value-to-result relationship was still not monotonic.
+
+**Interpretation.** Once momentum is enabled, a high-order solver's
+intermediate stages no longer improve the estimate; they amplify small early
+perturbations instead. The higher the order, the stronger the amplification —
+so the accuracy you are paying extra model evaluations for is lost.
+
+**Recommendation.**
+
+| Sampler | Momentum |
+|---|---|
+| Euler, LMS, and other single-stage methods | Usable |
+| Heun, DPM++ 2M / 3M, and other multi-stage methods | Not recommended |
+| TDE Sampler / RK Sampler (multi-stage or adaptive solvers) | Not recommended |
+
+Momentum defaults to `0` (off), which keeps APG a purely stateless
+per-evaluation transform and safe to combine with any sampler.
+
+---
+
+## Composition with other extensions
+
+`sorting_priority = 14.5` places APG last in the pre-CFG chain:
 
 ```
-TCFG (13.0) → SkimmedCFG (14.0) → DifferenceCFG (14.2) → APG (14.5) → CFG core → CFGZeroStar (15.0) → MaHiRo (15.5)
+TCFG (13.0) → SkimmedCFG (14.0) → DifferenceCFG (14.2) → APG (14.5)
+    → CFG → CFGZeroStar (15.0) → MaHiRo (15.5)
 ```
 
-This placement matches APG's role as the final reshaping of the guidance vector before CFG applies it. On Forge Neo, TCFG's damped uncond is read from `model_options["_tcfg_damped_uncond"]` when TCFG ran earlier in the same post-CFG list, so the two compose correctly.
+This matches the "final polish before CFG" role recommended for APG.
 
-When stacking multiple CFG-axis extensions, keep the session CFG within a moderate range to avoid cumulative correction breakdown.
-
-### Note on high CFG
-
-APG is designed to address exactly the oversaturation and artifacts that high guidance scales produce, so it is a natural fit for high-CFG workflows. At high CFG the guidance norm grows, so Norm Threshold (default 15) starts to clamp actively and its effect becomes visible; the best Eta may also differ from the low-CFG case. A separate sweep at your working CFG is worthwhile.
+On Forge Neo, TCFG's damped uncond is read from the shared
+`model_options` dict when TCFG ran earlier in the same post-CFG call.
 
 ---
 
-## Implementation note — `process_before_every_sampling()`
+## Differences from the ComfyUI built-in node
 
-Forge-based WebUIs rebuild `forge_objects.unet` between `process()` and the actual sampling start.
-Any hook registered in `process()` is silently discarded when this rebuild occurs.
+Both differences are deliberate.
 
-This extension registers its hook in `process_before_every_sampling()`, where `forge_objects.unet` is already the same object the sampler will reference.
-Metadata for PNG Info is written separately in `process()` so `create_infotext` captures it. The `APG Eta` key is written only when the extension is active, so its presence on the read side doubles as the enable marker for the PNG Info round-trip.
+| | This extension | ComfyUI `APG` node |
+|---|---|---|
+| Final combination | `cond + (cond_scale - 1) * update` (paper Algorithm 1) | effectively `cond + cond_scale * update` |
+| Reduction dims | all non-batch dims (`range(1, ndim)`) | fixed `dim=[-1, -2, -3]` |
 
----
+The first means the neutral settings reduce to standard CFG exactly, which
+the ComfyUI node cannot do — it is always one guidance unit stronger.
 
-## Tested environments
-
-- reForge (Python 3.10) — SDXL-family models; txt2img confirmed, first-step `cond_scale` verified.
-- Forge Neo (Python 3.12) — post-CFG path.
-
-Not compatible with A1111 (`set_model_sampler_pre_cfg_function` is Forge-backend only).
-
----
+The second is identical to the paper for 4-D `(B, C, H, W)` latents but keeps
+the paper's per-sample semantics for 5-D `(B, C, T, H, W)` latents instead of
+silently becoming per-channel. HuggingFace diffusers'
+`AdaptiveProjectedGuidance` makes the same choice (`norm_dim=None`).
 
 ---
 
-# 日本語
+## Infotext keys
 
-**[English](#sd-webui-apg)** | 日本語
+```
+APG Eta, APG Norm Threshold, APG Momentum
+```
 
-Forge 系 WebUI 向け Pre-CFG ガイダンス拡張機能。
-CFG ガイダンスベクトルを、条件付き予測に対して平行な成分と直交な成分に分解し、平行成分を減衰させます。平行成分は高いガイダンススケールで生じる過飽和とアーティファクトの主因です。
+`APG Eta` is written only while APG is active, so its presence in the
+infotext doubles as the enable marker on read-back.
 
-論文: [arXiv:2410.02416](https://arxiv.org/abs/2410.02416)（ICLR 2025）— "Eliminating Oversaturation and Artifacts of High Guidance Scales in Diffusion Models"
+> Images generated with v1.x may also carry an `APG Adaptive Momentum` key.
+> That feature has been removed; the key is ignored on read and does not
+> prevent the rest of the settings from being restored.
 
-> `Eta = 1`・`Norm Threshold = 0`・`Momentum = 0` のとき、通常 CFG と完全に等価です。
+---
+
+## Removed feature: Adaptive Momentum
+
+Releases before v2.0 offered an **Adaptive Momentum** slider, an original
+addition that faded the momentum coefficient to zero over the early part of
+the sigma schedule. It has been removed.
+
+Fixed-seed testing showed that the parameter did not behave as a continuous
+control at any setting:
+
+- Below roughly `0.21` it had no effect at all (bit-identical to momentum
+  applied normally).
+- Above that threshold it took effect, but the value and the result were not
+  related monotonically — neighbouring values produced results as far apart
+  from each other as they were from the baseline.
+- Raising it toward `1.0` did not converge on momentum-off behaviour, because
+  the coefficient decays but never stops being applied.
+
+The exact threshold also moved depending on the solver, since it is the
+number of model evaluations before the cut-off that decides the outcome.
+A slider whose value cannot be reasoned about is worse than no slider, so it
+was dropped rather than documented as a quirk.
+
+---
+
+<a id="日本語"></a>
+
+# sd-webui-APG（日本語）
+
+Stable Diffusion WebUI（Forge 系）向けの Adaptive Projected Guidance（APG）拡張機能です。
+
+[**Eliminating Oversaturation and Artifacts of High Guidance Scales in Diffusion Models**](https://arxiv.org/abs/2410.02416)（ICLR 2025）の Algorithm 1 の実装です。
+
+> APG は高い CFG スケールで発生する彩度過多やアーチファクトを抑えます。
+> 色飛びやコントラストの破綻を気にせず CFG を上げ、プロンプトへの追従を
+> 強められます。
+
+---
+
+## 特徴
+
+- ComfyUI ノードではなく**論文の式**に忠実。中立設定で標準 CFG を**完全に**再現します（固定シードのピクセル単位 A/B 比較で確認済み）。
+- **reForge / Forge Classic**（Pre-CFG フック）と **Forge Neo**（Post-CFG フック）に対応。バックエンドは自動判別します。
+- 階数非依存の射影により、4 次元の SDXL latent と 5 次元の Anima / NextDiT latent の両方に対応。
+- `sorting_priority` により他のガイダンス拡張と正しい順序で合成されます。
+- 全パラメータの XYZ Grid 軸を提供。
+- 生成パラメータを PNG infotext に埋め込み、再現可能です。
 
 ---
 
@@ -151,122 +239,160 @@ CFG ガイダンスベクトルを、条件付き予測に対して平行な成�
 https://github.com/seti9585/sd-webui-APG
 ```
 
+> この拡張機能は Forge バックエンドのフック API を利用します。
+> A1111（AUTOMATIC1111）では動作しません。
+
+---
+
+## 動作原理
+
+APG はガイダンスベクトルを、条件付き予測に**平行な成分**と**直交する成分**に分解します。平行成分は latent を既に進んでいる方向へさらに押し込むもので、高 CFG における彩度過多の主因です。これを縮小すれば、意味的な誘導（直交成分）を保ったまま色飛びだけを取り除けます。
+
+```
+diff      = cond - uncond
+diff      = momentum_buffer.update(diff)      （任意、beta != 0 のとき）
+diff      = L2 ノルムを norm_threshold にクランプ  （任意、threshold > 0 のとき）
+par, orth = diff を cond に射影して分解
+update    = orth + eta * par
+final     = cond + (cond_scale - 1) * update
+```
+
 ---
 
 ## パラメータ
 
-| パラメータ | 既定値 | 説明 |
-| --- | --- | --- |
-| Eta            | 0.00 | 平行成分を残す割合。`0` で完全に除去（論文推奨の既定値、脱飽和が最も強い）。`1` で完全に残し、射影が恒等変換になる。 |
-| Norm Threshold | 15.0 | ガイダンスベクトルへのサンプルごとの L2 クランプ。`0` で無効。論文の Stable Diffusion XL 設定は `15`（Table 10）。 |
-| Momentum       | 0.00 | モデル評価をまたぐガイダンスベクトルの移動平均係数。`0` で無効（既定）。論文の実験では `-0.5` などの負値を使用。**既定では無効 — 下記の注記を参照。** |
+| 項目 | 範囲 | 既定値 | 説明 |
+|---|---|---|---|
+| **Enable APG** | — | オフ | 有効化スイッチ。 |
+| **Eta** | 0.0 〜 2.0 | 0.0 | 平行成分をどれだけ残すか。`0` が論文推奨の既定値、`1.0` で全て残す（＝射影が無効）。結果が平坦・低彩度に見える場合は上げます。 |
+| **Norm Threshold** | 0.0 〜 50.0 | 15.0 | ガイダンスベクトルのサンプルごとの L2 クランプ。`0` で無効。論文は SDXL に `15` を使用。 |
+| **Momentum** | -1.5 〜 1.0 | 0.0 | 移動平均係数（beta）。`0` で無効。論文は `-0.5` などの負値を使用。**有効化する前に下の警告を必ずお読みください。** |
 
-Eta が主要な制御軸です。0 から上げると彩度が戻り、Norm Threshold をガイダンスノルムより下げると単一ステップの大きさを抑え始め、Momentum は評価間の急変を平滑化しますがサンプラーと相互作用します（下記参照）。
-
-### 目安の初期値（APG 単体）
-
-CFG 7（SDXL 系、TDE Sampler `euler`、AYS、単一変数 A/B）での Eta スイープに基づく目安：
-
-- Eta の見た目の効果は大半が `0.0 → 0.1` の区間に集中し、`0.2` で少し追加、`0.3` 以上は逓減します。これは線形の式 `update = 直交 + Eta × 平行` の通りの挙動です。
-- 実用的な常用の出発点は **Eta 0.2 / Norm Threshold 15 / Momentum 0**（彩度が戻り、安全）。より締まった高コントラスト寄りにするなら Eta を `0.1` へ下げます。
-- ここでテストした CFG 7 ではガイダンスノルムが 15 を超える場面が少なく、Norm Threshold は実質的に無発動の安全弁です。単一ステップの大きさを明示的に抑えたいときだけ `10` 前後まで下げてください。より高い CFG ではクランプが発動し、効果が大きくなります。
-
----
-
-## Momentum と ODE サンプラー
-
-Momentum は、可視のサンプリングステップではなく **モデル評価** をまたいでガイダンスベクトルの移動平均を保持します。この状態の持ち越しが、既定で無効にしている理由です：
-
-- Runge–Kutta 法や可変ステップ法の収束次数は、右辺が `(x, sigma)` のみに依存することを前提とします。Eta と Norm Threshold は評価ごとのステートレスな変換でこの前提を保ちますが、Momentum は保ちません。
-- RK Sampler `fe_kutta4` のような多段ソルバーは 1 ステップあたり 4 回評価するため、移動平均は 1 ステップに 4 回更新され、1 評価/1 ステップのソルバーより古い寄与が速く減衰します。同じ Momentum 値でもサンプラーによって効き方が変わります。
-- 可変ステップ法はステップを棄却・再試行します。棄却された評価も蓄積され、一時的に大きい sigma での再試行は sigma 増加リセットも誤発火させます。どちらも実効的な Momentum を許容誤差設定に依存させます。
-
-Momentum を使う場合は、1 評価/1 ステップの固定ステップソルバー（例：`fe_euler1`・`euler`）で `-0.5` 前後を推奨します。それ以外では `0` のままにしてください。`0` のとき APG は純粋にステートレスな評価ごとの変換になります。
-
----
-
-## アルゴリズム
+### 中立設定
 
 ```
-diff       = cond − uncond                          # denoised (x0) 空間
-diff       = momentum_buffer.update(diff)           # 任意（Momentum ≠ 0）
-diff       = diff × min(1, norm_threshold / ‖diff‖) # 任意（Norm Threshold > 0）
-parallel   = diff を cond 方向へ射影
-orthogonal = diff − parallel
-update     = orthogonal + Eta × parallel
-output     = cond + (cfg_scale − 1) × update
+Eta 1.0 / Norm Threshold 0 / Momentum 0
 ```
 
-ノルムと射影の集約は、バッチ以外の全次元（サンプルごと）で行います。射影は倍精度で計算してから元の型に戻します。
+この設定は標準 CFG をビット単位で再現します。APG が実際に何を変えているかを測る際の A/B 基準として使えます。
 
-`Eta = 1`・`Norm Threshold = 0`・`Momentum = 0` のとき `update = diff = cond − uncond` となり、出力は `uncond + cfg_scale × (cond − uncond)`、すなわち通常 CFG とビット同一になります。固定シードの A/B 基準として利用できます。
+### 設定の目安
 
-### ComfyUI ビルトイン APG ノードとの差異
+| 状況 | Eta | Norm Threshold | Momentum |
+|---|---|---|---|
+| 論文既定値（単独使用・高 CFG） | 0.0 | 15.0 | 0.0 |
+| 結果が眠い・コントラスト不足 | 0.3 〜 0.7 | 15.0 | 0.0 |
+| **他のガイダンス拡張と併用** | 1.0 | 0.0 | 0.0 |
 
-本移植は論文の Algorithm 1 に従っており、ComfyUI の `comfy_extras/nodes_apg.py` と 2 点で異なります：
-
-- **最終合成。** 本拡張は論文に合わせて `cond + (cfg_scale − 1) × update` を使います。ComfyUI ノードは実質的に `cond + cfg_scale × update` となり、ガイダンス 1 単位分強く、中立設定でも通常 CFG に一致しません。中立の A/B 基準を成立させるため、本移植では論文の形を採用しています。
-- **集約次元。** ノルムと射影を固定の `dim=[-1,-2,-3]` ではなく、バッチ以外の全次元（`range(1, ndim)`）で集約します。4 次元の SDXL 潜在 `(B, C, H, W)` では論文と同一です。5 次元潜在 `(B, C, T, H, W)` ではチャンネルごとに変化させず、論文のサンプルごとの意味を保ちます。HuggingFace diffusers の `AdaptiveProjectedGuidance` も同じ選択をしています。
-
----
-
-## バックエンド適応フック
-
-| バックエンド | フック | 仕組み |
-| --- | --- | --- |
-| reForge / Forge Classic | Pre-CFG | `conds_out` の uncond スロットを `cond − update` で上書きします。バックエンドの標準 CFG ステップが、任意の CFG スケールで `cond + (cfg_scale − 1) × update` を生成します。上書き自体はスケールに依存しません。 |
-| Forge Neo | Post-CFG | Forge Neo の pre-CFG はモデル評価の前に走るため予測が利用できません。最終予測を `cond + (cfg_scale − 1) × update` として直接再計算し、post-CFG リスト内で優先度順に配置します。 |
-
-Momentum バッファはサンプリングパスごとに新規作成され（txt2img と Hires.fix は独立した状態を持つ）、呼び出し間で sigma が増加した際の二次的なリセットも備えます。
-
-reForge では、初回ステップの `cond_scale` が設定した CFG 値と一致することを確認済みです（`cond_scale = 1.0` になる初回ステップの癖はなし）。上書きはいずれにせよスケール非依存です。
+TCFG / SkimmedCFG / DifferenceCFG などの上に APG を重ねる場合、論文の既定値は通常強すぎます。チェーン内の各拡張がすでにガイダンスの大きさを削っているためです。中立設定から始め、Eta を少しずつ下げていくことをお勧めします。
 
 ---
 
-## 他拡張との併用
+## ⚠ Momentum と高次ソルバーについて
 
-APG（Pre-CFG、`sorting_priority = 14.5`）は pre-CFG チェーンの末尾、CFG コアの直前に位置します：
+**Momentum は多段ソルバーおよび可変ステップソルバーとの併用を推奨しません。**
+
+momentum バッファは**モデル評価をまたいで**移動平均を保持します。そのため被積分関数が `(x, sigma)` だけの関数ではなくなり、ODE ソルバーが前提とする「右辺が無状態である」という条件が崩れます。
+
+- 多段法は 1 ステップあたり複数回モデルを評価するため（`kutta4` は 4 回）、同じステップ数でも単段法よりバッファの蓄積が数倍速くなります。
+- 可変ステップ制御は棄却されたステップを再評価するため、蓄積速度が許容誤差の設定に依存します。
+
+固定シードでの実測（SDXL / 35 ステップ / Align Your Steps / CFG 7）では、これが単なる係数のスケールの違いではないことが確認されました。4 段ソルバーでは、momentum 関連のパラメータをごくわずかに変えただけで、結果が「元の基準からの距離とほぼ同じだけ」動きました。つまり比例して変化するのではなく、**無関係な別の解に飛んだ**ということです。単段ソルバーでは変位はおよそ半分でしたが、値と結果の対応が単調でない点は変わりませんでした。
+
+**解釈。** momentum を有効にした時点で、高次ソルバーの中間段はもはや推定精度を改善しません。代わりに初期の微小な摂動を増幅します。次数が高いほど増幅は強くなるため、**余分なモデル評価を払って得ていたはずの精度が失われます**。
+
+**推奨。**
+
+| サンプラー | Momentum |
+|---|---|
+| Euler、LMS その他の単段法 | 使用可 |
+| Heun、DPM++ 2M / 3M その他の多段法 | 非推奨 |
+| TDE Sampler / RK Sampler（多段・可変ステップソルバー） | 非推奨 |
+
+Momentum の既定値は `0`（オフ）です。この状態では APG は完全に無状態な評価ごとの変換であり、どのサンプラーと組み合わせても安全です。
+
+---
+
+## 他の拡張機能との合成
+
+`sorting_priority = 14.5` により、APG は pre-CFG チェーンの最後に配置されます。
 
 ```
-TCFG (13.0) → SkimmedCFG (14.0) → DifferenceCFG (14.2) → APG (14.5) → CFG コア → CFGZeroStar (15.0) → MaHiRo (15.5)
+TCFG (13.0) → SkimmedCFG (14.0) → DifferenceCFG (14.2) → APG (14.5)
+    → CFG → CFGZeroStar (15.0) → MaHiRo (15.5)
 ```
 
-この配置は、CFG が適用する直前にガイダンスベクトルを最終整形するという APG の役割に合致します。Forge Neo では、同じ post-CFG リスト内で TCFG が先に走った場合、TCFG の減衰済み uncond を `model_options["_tcfg_damped_uncond"]` から読み取るため、両者は正しく合成されます。
+これは APG に推奨される「CFG 直前の最終調整」という役割に一致します。
 
-複数の CFG 軸拡張を重ねる場合は、セッション CFG を穏当な範囲に抑え、補正の累積破綻を避けてください。
-
-### 高 CFG について
-
-APG は、高いガイダンススケールが生む過飽和とアーティファクトそのものに対処する設計なので、高 CFG ワークフローと自然に相性が良いです。高 CFG ではガイダンスノルムが大きくなるため、Norm Threshold（既定 15）が実際にクランプを始め、効果が可視化されます。最適な Eta も低 CFG の場合とは異なる可能性があります。運用する CFG での個別のスイープを推奨します。
+Forge Neo では、同一の post-CFG 呼び出し内で TCFG が先に実行されていた場合、共有の `model_options` から TCFG の減衰済み uncond を読み取ります。
 
 ---
 
-## 実装上の注意点 — `process_before_every_sampling()` の使用について
+## ComfyUI 組み込みノードとの相違点
 
-Forge 系 WebUI は `process()` の実行後、サンプリング開始前に `forge_objects.unet` を再構築します。
-そのため `process()` 内で登録したフックは再構築時に消えてしまい、サンプリング中に一切呼ばれません。
+いずれも意図的な相違です。
 
-本拡張はフック登録を `process_before_every_sampling()` で行っています。このタイミングでは `forge_objects.unet` がサンプラーの参照先と同一オブジェクトです。
-PNG Info 用のメタデータは `create_infotext` が拾えるよう `process()` で別途書き込みます。`APG Eta` キーは拡張が有効なときのみ書かれるため、読み取り側ではその存在が PNG Info 往復の有効化マーカーを兼ねます。
+| | 本拡張 | ComfyUI `APG` ノード |
+|---|---|---|
+| 最終合成 | `cond + (cond_scale - 1) * update`（論文 Algorithm 1） | 実質 `cond + cond_scale * update` |
+| 縮約次元 | バッチ以外の全次元（`range(1, ndim)`） | 固定の `dim=[-1, -2, -3]` |
 
----
+第一の相違により、中立設定が標準 CFG に完全に一致します。ComfyUI ノードでは常にガイダンス 1 単位分強いため、これができません。
 
-## 動作確認環境
-
-- reForge（Python 3.10）— SDXL 系モデル。txt2img 確認済み、初回ステップの `cond_scale` を検証済み。
-- Forge Neo（Python 3.12）— post-CFG 経路。
-
-A1111 非対応（`set_model_sampler_pre_cfg_function` は Forge バックエンド専用）。
+第二の相違は 4 次元 `(B, C, H, W)` latent では論文と同一です。5 次元 `(B, C, T, H, W)` latent において、暗黙にチャンネルごとの処理になってしまうのを避け、論文のサンプル単位の意味を保ちます。HuggingFace diffusers の `AdaptiveProjectedGuidance` も同じ選択をしています（`norm_dim=None`）。
 
 ---
 
-## ライセンス・典拠
+## infotext キー
 
-Based on: [arXiv:2410.02416](https://arxiv.org/abs/2410.02416) "Eliminating Oversaturation and Artifacts of High Guidance Scales in Diffusion Models" (ICLR 2025)
+```
+APG Eta, APG Norm Threshold, APG Momentum
+```
 
-Reference implementations consulted: the ComfyUI built-in APG node (`comfy_extras/nodes_apg.py`) and **Shiba-2-shiba**'s APGForge implementation for Forge Classic. This extension is written from the paper above; the pointers that made it knowable are gratefully acknowledged.
+`APG Eta` は APG が有効なときのみ書き込まれるため、infotext 中の存在自体が読み込み時の有効化マーカーを兼ねます。
 
-Inspired by **Shiba-2-shiba**'s note articles on CFG-related ComfyUI nodes:
-[ComfyUIのCFG関連の4ノードの勉強＠APG, TCFG, Fresca, Mahiroノードについて](https://note.com/gentle_murre488/n/nc709aac794bc)
+> v1.x で生成した画像には `APG Adaptive Momentum` キーが含まれている場合があります。この機能は削除されましたが、当該キーは読み込み時に無視されるだけで、他の設定の復元を妨げません。
 
-本拡張機能は、**Shiba-2-shiba** さんの note 記事「[ComfyUIのCFG関連の4ノードの勉強＠APG, TCFG, Fresca, Mahiroノードについて](https://note.com/gentle_murre488/n/nc709aac794bc)」から着想を得ています。原実装として ComfyUI ビルトイン APG ノードおよび Shiba-2-shiba さんの Forge Classic 向け APGForge 実装を参照しました。本拡張は上記論文に基づいて記述しています。
+---
+
+## 削除された機能: Adaptive Momentum
+
+v2.0 より前のリリースには **Adaptive Momentum** スライダーがありました。これは本移植独自の追加機能で、シグマスケジュールの前半にかけて momentum 係数をゼロへ減衰させるものでしたが、削除されました。
+
+固定シードでの検証により、この値がどの設定でも連続的な制御として機能しないことが判明したためです。
+
+- おおよそ `0.21` 以下では効果が一切ありませんでした（momentum をそのまま適用した場合とビット単位で一致）。
+- それ以上では効果が出ますが、値と結果が単調に対応しませんでした。隣り合う値どうしの結果が、基準からの距離と同じだけ離れていました。
+- `1.0` に近づけても momentum オフの挙動には収束しません。係数は減衰しますが、適用され続けること自体は止まらないためです。
+
+閾値の位置もソルバーによって移動します。結果を決めているのが打ち切りまでのモデル評価回数だからです。値について推論できないスライダーは、無いほうがましだと判断し、仕様として文書化するのではなく削除しました。
+
+---
+
+## License
+
+MIT License
+
+## Attribution / 典拠
+
+**Paper / 論文**
+
+Sadat, S., Hilliges, O., & Weber, R. M.
+*Eliminating Oversaturation and Artifacts of High Guidance Scales in Diffusion Models.*
+ICLR 2025. [arXiv:2410.02416](https://arxiv.org/abs/2410.02416)
+
+**Inspiration / 着想**
+
+The author first learned of APG through the note.com articles of
+[**Shiba-2-shiba**](https://note.com/gentle_murre488), whose
+[TCFG-APG-Mahiro-for-ForgeClassic](https://github.com/Shiba-2-shiba/TCFG-APG-Mahiro-for-ForgeClassic)
+implementation for Forge Classic was also consulted. This extension is
+written from the paper above; the pointer that made it knowable is
+gratefully acknowledged.
+
+APG の存在は [**Shiba-2-shiba**](https://note.com/gentle_murre488) 氏の note.com の記事によって知りました。Forge Classic 向けの実装である [TCFG-APG-Mahiro-for-ForgeClassic](https://github.com/Shiba-2-shiba/TCFG-APG-Mahiro-for-ForgeClassic) も参考にさせていただいています。本拡張機能は上記論文をもとに記述したものですが、知るきっかけを与えてくださったことに深く感謝します。
+
+**Reference implementations / 参考実装**
+
+- ComfyUI built-in `APG` node (`comfy_extras/nodes_apg.py`)
+- HuggingFace diffusers `AdaptiveProjectedGuidance`
