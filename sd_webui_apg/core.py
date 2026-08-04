@@ -38,16 +38,39 @@ Defaults (paper-derived):
                            is desired."
     norm_threshold = 15.0  Paper Table 10, the Stable Diffusion XL row (r=15).
     momentum       = 0.0   Paper Algorithm 1 signature default (buffer=None).
-                           Table 10 uses beta=-0.5 for SDXL, but momentum
-                           carries state across model EVALUATIONS, which
-                           breaks the stateless right-hand-side assumption of
-                           ODE samplers: multi-stage solvers (fe_kutta4 = 4
-                           evaluations per step) and adaptive step control
-                           (step rejection re-evaluates) change how fast the
-                           buffer accumulates, so the same beta behaves
-                           differently per sampler and per rtol/atol setting.
-                           Default OFF keeps APG a pure stateless per-
-                           evaluation transform; the slider remains available.
+                           Table 10 uses beta=-0.5 for SDXL. See the momentum
+                           section below for why this port defaults it OFF.
+
+Momentum and ODE samplers:
+    The momentum buffer carries state across model EVALUATIONS, which breaks
+    the stateless right-hand-side assumption of ODE samplers. Multi-stage
+    solvers (fe_kutta4 = 4 evaluations per step) and adaptive step control
+    (a rejected step is re-evaluated) change how fast the buffer accumulates,
+    so the same beta behaves differently per sampler and per rtol/atol
+    setting.
+
+    Fixed-seed A/B measurements (SDXL, 35 steps, Align Your Steps, CFG 7,
+    beta = -0.15) showed that this is not merely a scaling difference:
+
+      * With a single-stage solver (euler), varying an early-decay parameter
+        produced changes of roughly half the magnitude seen with a 4-stage
+        solver (kutta4) under identical settings.
+      * With kutta4, a parameter change of 0.01 moved the result about as far
+        as the result was from the baseline in the first place -- i.e. the
+        output jumped to an unrelated solution rather than changing by a
+        proportional amount.
+
+    Interpretation: once momentum is enabled the integrand is no longer a
+    function of (x, sigma) alone, so a high-order solver's intermediate
+    stages no longer improve the estimate; they amplify small early
+    perturbations instead. The higher the order, the stronger the
+    amplification.
+
+    Practical consequence: momentum is not recommended together with
+    high-order solvers (TDE Sampler / RK Sampler multi-stage methods,
+    Heun, DPM++ 2M/3M and similar). Momentum defaults to OFF, which keeps
+    APG a pure stateless per-evaluation transform; the slider remains
+    available for single-stage samplers.
 
 Momentum reset:
     A fresh closure (and thus a fresh MomentumBuffer) is created per sampling
@@ -187,16 +210,16 @@ class MomentumBuffer:
 
         running_average <- update + momentum * running_average
 
-    Verbatim port of the paper's MomentumBuffer. A negative momentum
-    coefficient subtracts a fraction of the previously accumulated guidance,
-    damping abrupt evaluation-to-evaluation changes.
+    Verbatim port of the paper's MomentumBuffer. A negative coefficient
+    subtracts a fraction of the previously accumulated guidance, damping
+    abrupt evaluation-to-evaluation changes.
     """
 
     __slots__ = ("momentum", "running_average")
 
     def __init__(self, momentum: float):
         self.momentum = momentum
-        self.running_average = 0.0  # scalar 0 broadcasts on first update
+        self.running_average = 0.0        # scalar 0 broadcasts on first update
 
     def update(self, value: torch.Tensor) -> torch.Tensor:
         self.running_average = value + self.momentum * self.running_average
@@ -243,6 +266,9 @@ def _apg_update(
     """Compute the APG-reshaped guidance update vector.
 
     Order matches paper Algorithm 1: momentum -> rescale -> projection.
+    The momentum stage is skipped entirely when the coefficient is 0 so that
+    the default configuration stays a stateless per-evaluation transform.
+
     The final combination with cond_scale is done by the caller (it differs
     between the pre-CFG write-back and the post-CFG direct recomputation).
     """
@@ -268,6 +294,22 @@ def _apg_update(
 
 
 # ---------------------------------------------------------------------------
+# Shared per-closure state helper
+# ---------------------------------------------------------------------------
+
+def _track_sigma(state: dict, buffer: MomentumBuffer, sigma: float) -> None:
+    """Reset the momentum buffer when sigma increases between evaluations.
+
+    A sigma increase means a new trajectory has started (e.g. a hires.fix
+    pass reusing a stale closure), so the accumulated running average is no
+    longer meaningful.
+    """
+    if state["prev_sigma"] is not None and sigma > state["prev_sigma"]:
+        buffer.reset()
+    state["prev_sigma"] = sigma
+
+
+# ---------------------------------------------------------------------------
 # Pre-CFG factory (reForge / Forge Classic)
 # ---------------------------------------------------------------------------
 # reForge pre-CFG args dict keys used here:
@@ -278,7 +320,11 @@ def _apg_update(
 #   "sigma"      — timestep tensor (used for the momentum reset guard)
 # ---------------------------------------------------------------------------
 
-def _make_apg_pre_fn(eta: float, norm_threshold: float, momentum: float):
+def _make_apg_pre_fn(
+    eta: float,
+    norm_threshold: float,
+    momentum: float,
+):
     """APG — Pre-CFG (reForge / Forge Classic).
 
     Write-back trick: overwriting conds_out[1] with (cond - update) makes the
@@ -298,10 +344,7 @@ def _make_apg_pre_fn(eta: float, norm_threshold: float, momentum: float):
                 # CFG == 1 optimization: no usable uncond; nothing to do.
                 return conds_out
 
-            sigma = _sigma_scalar(args["sigma"])
-            if state["prev_sigma"] is not None and sigma > state["prev_sigma"]:
-                buffer.reset()
-            state["prev_sigma"] = sigma
+            _track_sigma(state, buffer, _sigma_scalar(args["sigma"]))
 
             cond = conds_out[0]
             uncond = conds_out[1]
@@ -329,7 +372,11 @@ def _make_apg_pre_fn(eta: float, norm_threshold: float, momentum: float):
 #   "model_options"   — shared dict; read for TCFG's stashed damped uncond
 # ---------------------------------------------------------------------------
 
-def _make_apg_post_fn(eta: float, norm_threshold: float, momentum: float):
+def _make_apg_post_fn(
+    eta: float,
+    norm_threshold: float,
+    momentum: float,
+):
     """APG — Post-CFG (Forge Neo).
 
     Recomputes the final prediction directly with the paper formula
@@ -346,10 +393,7 @@ def _make_apg_post_fn(eta: float, norm_threshold: float, momentum: float):
             if uncond_denoised is None or not torch.any(uncond_denoised):
                 return args["denoised"]
 
-            sigma = _sigma_scalar(args["sigma"])
-            if state["prev_sigma"] is not None and sigma > state["prev_sigma"]:
-                buffer.reset()
-            state["prev_sigma"] = sigma
+            _track_sigma(state, buffer, _sigma_scalar(args["sigma"]))
 
             cond_scale = args["cond_scale"]
 
@@ -388,7 +432,12 @@ def remove_apg_patches(unet) -> None:
             unet.model_options[key] = [fn for fn in existing if not _is_apg_fn(fn)]
 
 
-def apply_apg(unet, eta: float, norm_threshold: float, momentum: float):
+def apply_apg(
+    unet,
+    eta: float,
+    norm_threshold: float,
+    momentum: float,
+):
     """Register APG on unet, choosing the correct hook for the backend.
 
       * Forge Neo               -> Post-CFG, priority-ordered so it runs after
@@ -402,11 +451,14 @@ def apply_apg(unet, eta: float, norm_threshold: float, momentum: float):
 
     Parameters:
       eta            : parallel-component scale (paper recommends 0.0;
-                       1.0 keeps the parallel component fully = projection off)
-      norm_threshold : per-sample L2 clamp on the guidance vector (0 disables;
-                       paper Table 10 uses 15.0 for SDXL)
+                       1.0 keeps the parallel component fully = projection
+                       off)
+      norm_threshold : per-sample L2 clamp on the guidance vector
+                       (0 disables; paper Table 10 uses 15.0 for SDXL)
       momentum       : running-average coefficient (0 disables; the paper's
-                       experiments use negative values such as -0.5)
+                       experiments use negative values such as -0.5). Not
+                       recommended with high-order solvers -- see the module
+                       docstring.
     """
     remove_apg_patches(unet)
 
@@ -417,7 +469,8 @@ def apply_apg(unet, eta: float, norm_threshold: float, momentum: float):
 
     if _is_forge_neo_backend():
         _priority_insert_post_cfg(
-            unet, _make_apg_post_fn(eta, norm_threshold, momentum)
+            unet,
+            _make_apg_post_fn(eta, norm_threshold, momentum),
         )
         logger.debug("[APG] registered post-CFG hook (Forge Neo backend)")
     else:
