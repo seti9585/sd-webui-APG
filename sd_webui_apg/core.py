@@ -22,8 +22,18 @@ kept deliberately:
     The ComfyUI node effectively yields cond + cond_scale * update, which
     is one guidance unit stronger and never reduces to standard CFG.
     With the paper form, the NEUTRAL settings eta = 1.0, norm_threshold = 0,
-    momentum = 0 reproduce standard CFG exactly (clean fixed-seed A/B
-    baseline).
+    momentum = 0 reduce to standard CFG algebraically. This is an algebraic
+    identity, not a bitwise one: _project() decomposes the guidance vector
+    in double precision and casts the parts back, so the round trip
+    perturbs the low-order bits even though parallel + orthogonal sums to
+    the original diff. The CPU numerical suite confirms the identity to a
+    tolerance of 0.000001, but on a real sampling run the perturbation is
+    amplified by the solver. Measured on SDXL with kutta4, Align Your
+    Steps, 35 steps, CFG 7 and a fixed seed, the neutral setting differs
+    from a bare run by a mean absolute RGB difference of about 0.74.
+    Do NOT use the neutral setting as a bitwise A/B baseline; disable the
+    extension instead. The ComfyUI node does not reduce to standard CFG at
+    all, algebraically or otherwise.
   * Projection / norm reduction runs over ALL non-batch dimensions
     (range(1, ndim)) instead of the fixed dim=[-1, -2, -3]. For 4-D SDXL
     latents (B, C, H, W) this is identical to the paper's Algorithm 1.
