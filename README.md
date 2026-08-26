@@ -156,6 +156,8 @@ Both differences are deliberate.
 |---|---|---|
 | Final combination | `cond + (cond_scale - 1) * update` (paper Algorithm 1) | effectively `cond + cond_scale * update` |
 | Reduction dims | all non-batch dims (`range(1, ndim)`) | fixed `dim=[-1, -2, -3]` |
+| Precision of the projection | computed in `double`, cast back (paper Algorithm 1) | computed in the input dtype |
+| Momentum reset | none; a fresh buffer per sampling pass | buffer cleared whenever sigma increases |
 
 The first means the neutral settings reduce to standard CFG exactly, which
 the ComfyUI node cannot do — it is always one guidance unit stronger.
@@ -164,6 +166,14 @@ The second is identical to the paper for 4-D `(B, C, H, W)` latents but keeps
 the paper's per-sample semantics for 5-D `(B, C, T, H, W)` latents instead of
 silently becoming per-channel. HuggingFace diffusers'
 `AdaptiveProjectedGuidance` makes the same choice (`norm_dim=None`).
+
+The fourth is a removal. The script layer builds a fresh closure, and
+therefore a fresh momentum buffer, for every sampling pass, so a running
+average can never survive into an unrelated run. A sigma-increase guard adds
+nothing on top of that, and it actively misfires on adaptive-step solvers
+such as those in sd-webui-TDE-Sampler and sd-webui-RK-Sampler, which
+legitimately re-try a rejected step at a larger sigma. Clearing the buffer
+there discards a valid running average mid-trajectory.
 
 ---
 
@@ -330,10 +340,22 @@ Forge Neo では、同一の post-CFG 呼び出し内で TCFG が先に実行さ
 
 ## ComfyUI 組み込みノードとの相違点
 
-いずれも意図的な相違です。
+いずれの相違点も意図的なものです。
 
-| | 本拡張 | ComfyUI `APG` ノード |
+| | 本拡張機能 | ComfyUI `APG` ノード |
 |---|---|---|
+| 最終合成 | `cond + (cond_scale - 1) * update`（論文 Algorithm 1） | 実質的に `cond + cond_scale * update` |
+| 縮約次元 | バッチ以外の全次元（`range(1, ndim)`） | 固定の `dim=[-1, -2, -3]` |
+| 射影の精度 | `double` で計算して戻す（論文 Algorithm 1） | 入力の dtype のまま計算 |
+| Momentum リセット | なし。サンプリングパスごとに新しいバッファ | σ が増加するたびにバッファを破棄 |
+
+1 点目により、中立設定が標準 CFG に厳密に一致します。ComfyUI ノードは常に 1 ガイダンス単位分強いため、これができません。
+
+2 点目は 4 次元 `(B, C, H, W)` の潜在表現では論文と同一です。5 次元 `(B, C, T, H, W)` の潜在表現において、暗黙にチャネル単位へ変わってしまうことを避け、論文のサンプル単位の意味を保ちます。HuggingFace diffusers の `AdaptiveProjectedGuidance` も同じ選択をしています（`norm_dim=None`）。
+
+4 点目は削除です。スクリプト層がサンプリングパスごとに新しいクロージャ、したがって新しい momentum バッファを生成するため、移動平均が無関係な実行へ持ち越されることはありません。σ 増加ガードはその上に何も付け加えず、むしろ sd-webui-TDE-Sampler や sd-webui-RK-Sampler のような適応ステップソルバーで誤発火します。これらは棄却したステップをより大きい σ で再試行する正当な動作をするため、そこでバッファを破棄すると軌道の途中で有効な移動平均を捨てることになります。
+
+---|---|---|
 | 最終合成 | `cond + (cond_scale - 1) * update`（論文 Algorithm 1） | 実質 `cond + cond_scale * update` |
 | 縮約次元 | バッチ以外の全次元（`range(1, ndim)`） | 固定の `dim=[-1, -2, -3]` |
 
@@ -369,9 +391,11 @@ v2.0 より前のリリースには **Adaptive Momentum** スライダーがあ�
 
 ---
 
-## License
+## License / ライセンス
 
-MIT License
+**MIT License** — see [LICENSE](LICENSE).
+
+Copyright (c) 2026 seti9585
 
 ## Attribution / 典拠
 
@@ -381,16 +405,39 @@ Sadat, S., Hilliges, O., & Weber, R. M.
 *Eliminating Oversaturation and Artifacts of High Guidance Scales in Diffusion Models.*
 ICLR 2025. [arXiv:2410.02416](https://arxiv.org/abs/2410.02416)
 
-**Inspiration / 着想**
+The algorithm in this extension is written from Algorithm 1 of that paper,
+which the authors publish as the reference implementation of APG. The
+`MomentumBuffer` class, the double-precision projection, the scalar-zero
+initial running average and the `(guidance_scale - 1)` final combination all
+follow that listing.
+
+本拡張機能のアルゴリズムは、上記論文の Algorithm 1 をもとに記述しています。同 Algorithm は著者らが APG の参照実装として公開しているものです。`MomentumBuffer` クラス、倍精度での射影、移動平均のスカラー 0 初期化、`(guidance_scale - 1)` による最終合成は、いずれも同 Algorithm に従っています。
+
+## Acknowledgements / 謝辞
+
+**Shiba-2-shiba**
 
 The author first learned of APG through the note.com articles of
 [**Shiba-2-shiba**](https://note.com/gentle_murre488), whose
 [TCFG-APG-Mahiro-for-ForgeClassic](https://github.com/Shiba-2-shiba/TCFG-APG-Mahiro-for-ForgeClassic)
-implementation for Forge Classic was also consulted. This extension is
-written from the paper above; the pointer that made it knowable is
-gratefully acknowledged.
+implementation for Forge Classic was also consulted. Development of this
+whole extension suite started from that work. The pointer that made APG
+knowable is gratefully acknowledged.
 
-APG の存在は [**Shiba-2-shiba**](https://note.com/gentle_murre488) 氏の note.com の記事によって知りました。Forge Classic 向けの実装である [TCFG-APG-Mahiro-for-ForgeClassic](https://github.com/Shiba-2-shiba/TCFG-APG-Mahiro-for-ForgeClassic) も参考にさせていただいています。本拡張機能は上記論文をもとに記述したものですが、知るきっかけを与えてくださったことに深く感謝します。
+APG の存在は [**Shiba-2-shiba**](https://note.com/gentle_murre488) 氏の note.com の記事によって知りました。Forge Classic 向けの実装である [TCFG-APG-Mahiro-for-ForgeClassic](https://github.com/Shiba-2-shiba/TCFG-APG-Mahiro-for-ForgeClassic) も参考にさせていただいています。本拡張スイート全体の開発は、この記事と実装をきっかけに始まりました。APG を知るきっかけを与えてくださったことに深く感謝します。
+
+**ComfyUI**
+
+The built-in `APG` node of [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
+(`comfy_extras/nodes_apg.py`, GPL-3.0) was read throughout development as a
+working reference for how APG is wired into a pre-CFG hook. Where this
+extension departs from it, the departures are listed above and are
+deliberate. No code was carried over: the algorithm follows the paper
+listing, and the one behaviour that had been aligned with the node — clearing
+the momentum buffer on a sigma increase — has been removed. Thanks are due to
+comfyanonymous and the ComfyUI contributors regardless.
+
+[ComfyUI](https://github.com/comfyanonymous/ComfyUI) の組み込み `APG` ノード（`comfy_extras/nodes_apg.py`、GPL-3.0）は、APG を pre-CFG フックへ組み込む実際の方法を示す参考として、開発を通じて参照しました。本拡張機能が異なる点は上記のとおりで、いずれも意図的なものです。コードの流用はありません。アルゴリズムは論文の Algorithm に従っており、唯一同ノードに挙動を合わせていた「σ 増加時の momentum バッファ破棄」も削除しました。それでもなお、comfyanonymous 氏および ComfyUI コントリビューターの皆様に感謝します。
 
 **Reference implementations / 参考実装**
 
