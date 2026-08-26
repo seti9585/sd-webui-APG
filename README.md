@@ -15,8 +15,9 @@ Implementation of [**Eliminating Oversaturation and Artifacts of High Guidance S
 ## Features
 
 - **Paper formulation**, not the ComfyUI node formulation — the neutral
-  settings reproduce standard CFG **exactly** (verified by fixed-seed
-  pixel-level A/B comparison).
+  settings reduce to standard CFG **algebraically**. The ComfyUI node does
+  not, at any setting. See [Neutral settings](#neutral-settings) for why this
+  is not a bitwise identity.
 - Works on **reForge / Forge Classic** (Pre-CFG hook) and **Forge Neo**
   (Post-CFG hook); the backend is detected automatically.
 - Rank-agnostic projection — supports both 4-D SDXL latents and 5-D
@@ -74,8 +75,21 @@ final     = cond + (cond_scale - 1) * update
 Eta 1.0 / Norm Threshold 0 / Momentum 0
 ```
 
-These reproduce standard CFG bit-for-bit. Use them as the A/B baseline when
-measuring what APG actually changes.
+These reduce to standard CFG **algebraically**: with `Eta 1.0` the parallel
+and orthogonal parts sum back to the original guidance vector, and with the
+other two disabled nothing else touches it.
+
+**This is not a bitwise identity, and the neutral setting is not a usable A/B
+baseline.** The projection decomposes the guidance vector in double precision
+and casts the parts back, so the round trip perturbs the low-order bits. A
+CPU numerical suite confirms the identity to a tolerance of `0.000001`, but
+during a real sampling run the solver amplifies that perturbation. Measured
+on SDXL with `kutta4`, Align Your Steps, 35 steps, CFG 7 and a fixed seed,
+the neutral setting differs from a bare run by a mean absolute RGB difference
+of about `0.74`, with 71 % of pixels differing.
+
+To measure what APG actually changes, **disable the extension** rather than
+neutralising it.
 
 ### Suggested starting points
 
@@ -159,8 +173,10 @@ Both differences are deliberate.
 | Precision of the projection | computed in `double`, cast back (paper Algorithm 1) | computed in the input dtype |
 | Momentum reset | none; a fresh buffer per sampling pass | buffer cleared whenever sigma increases |
 
-The first means the neutral settings reduce to standard CFG exactly, which
-the ComfyUI node cannot do — it is always one guidance unit stronger.
+The first means the neutral settings reduce to standard CFG algebraically,
+which the ComfyUI node cannot do at any setting — it is always one guidance
+unit stronger. See [Neutral settings](#neutral-settings) for why the
+algebraic identity does not carry through to a bitwise one.
 
 The second is identical to the paper for 4-D `(B, C, H, W)` latents but keeps
 the paper's per-sample semantics for 5-D `(B, C, T, H, W)` latents instead of
@@ -284,7 +300,11 @@ final     = cond + (cond_scale - 1) * update
 Eta 1.0 / Norm Threshold 0 / Momentum 0
 ```
 
-この設定は標準 CFG をビット単位で再現します。APG が実際に何を変えているかを測る際の A/B 基準として使えます。
+この設定は標準 CFG に**代数的に**帰着します。`Eta 1.0` では平行成分と直交成分の和が元のガイダンスベクトルに戻り、他の 2 つを無効にすれば他に手を加えるものがないためです。
+
+**これはビット単位の恒等ではなく、中立設定は A/B 基準として使えません。** 射影はガイダンスベクトルを倍精度で分解して各成分を戻すため、往復の丸めが下位ビットを変化させます。CPU 数値スイートでは許容誤差 `0.000001` で恒等性が確認されていますが、実際のサンプリングではソルバーがこの摂動を増幅します。SDXL / `kutta4` / Align Your Steps / 35 ステップ / CFG 7 / 固定シードで実測したところ、中立設定と素の実行との平均絶対 RGB 差は約 `0.74`、差分画素は 71 % でした。
+
+APG が実際に何を変えているかを測るには、中立設定にするのではなく**拡張機能自体を無効化**してください。
 
 ### 設定の目安
 
@@ -359,7 +379,7 @@ Forge Neo では、同一の post-CFG 呼び出し内で TCFG が先に実行さ
 | 最終合成 | `cond + (cond_scale - 1) * update`（論文 Algorithm 1） | 実質 `cond + cond_scale * update` |
 | 縮約次元 | バッチ以外の全次元（`range(1, ndim)`） | 固定の `dim=[-1, -2, -3]` |
 
-第一の相違により、中立設定が標準 CFG に完全に一致します。ComfyUI ノードでは常にガイダンス 1 単位分強いため、これができません。
+第一の相違により、中立設定が標準 CFG に代数的に帰着します。ComfyUI ノードはどの設定でもこれができず、常にガイダンス 1 単位分強くなります。代数的な恒等がビット単位の一致にならない理由については「中立設定」の節を参照してください。
 
 第二の相違は 4 次元 `(B, C, H, W)` latent では論文と同一です。5 次元 `(B, C, T, H, W)` latent において、暗黙にチャンネルごとの処理になってしまうのを避け、論文のサンプル単位の意味を保ちます。HuggingFace diffusers の `AdaptiveProjectedGuidance` も同じ選択をしています（`norm_dim=None`）。
 
