@@ -22,7 +22,7 @@ Implementation of [**Eliminating Oversaturation and Artifacts of High Guidance S
   (Post-CFG hook); the backend is detected automatically.
 - Rank-agnostic projection — supports both 4-D SDXL latents and 5-D
   Anima / NextDiT latents.
-- Composes with the rest of the guidance suite via `sorting_priority`.
+- Composes with the rest of the guidance suite via priority insertion at `_sd_webui_priority = 14.5` — see [Composition with other extensions](#composition-with-other-extensions).
 - XYZ Grid axes for all parameters.
 - Generation parameters are embedded in PNG infotext for reproducibility.
 
@@ -148,17 +148,31 @@ per-evaluation transform and safe to combine with any sampler.
 
 ## Composition with other extensions
 
-`sorting_priority = 14.5` places APG last in the pre-CFG chain:
+Execution order in the chain is decided by priority insertion
+(`_priority_insert_pre_cfg` / `_priority_insert_post_cfg` in `core.py`),
+not by `sorting_priority`, which only controls where this extension's
+accordion is drawn in the UI. APG registers at priority 14.5:
 
 ```
 TCFG (13.0) → SkimmedCFG (14.0) → DifferenceCFG (14.2) → APG (14.5)
-    → CFG → CFGZeroStar (15.0) → MaHiRo (15.5)
+    → CFG → CFGZeroStar (15.0) → FreSca (15.2) → MaHiRo (15.5)
+    → CFGNorm (16.0) → CFGRegulator (16.5)
 ```
 
 This matches the "final polish before CFG" role recommended for APG.
 
 On Forge Neo, TCFG's damped uncond is read from the shared
 `model_options` dict when TCFG ran earlier in the same post-CFG call.
+
+Set `SD_WEBUI_SETI_DEBUG=1` before launching to have the assembled chain
+printed at sampling time:
+
+```
+[APG] pre-CFG chain: _tcfg_pre_cfg_fn(13.0) -> ... -> _apg_pre_cfg_fn(14.5)
+```
+
+If the printed order differs from the list above, something in the chain
+is not participating in priority insertion.
 
 ---
 
@@ -248,10 +262,10 @@ Stable Diffusion WebUI（Forge 系）向けの Adaptive Projected Guidance（APG
 
 ## 特徴
 
-- ComfyUI ノードではなく**論文の式**に忠実。中立設定で標準 CFG を**完全に**再現します（固定シードのピクセル単位 A/B 比較で確認済み）。
+- ComfyUI ノードではなく**論文の式**に忠実。中立設定で標準 CFG に**代数的に**帰着します（ビット単位の恒等ではありません。詳細は[中立設定](#中立設定)を参照してください）。
 - **reForge / Forge Classic**（Pre-CFG フック）と **Forge Neo**（Post-CFG フック）に対応。バックエンドは自動判別します。
 - 階数非依存の射影により、4 次元の SDXL latent と 5 次元の Anima / NextDiT latent の両方に対応。
-- `sorting_priority` により他のガイダンス拡張と正しい順序で合成されます。
+- `_sd_webui_priority = 14.5` による優先度挿入で、他のガイダンス拡張と正しい順序で合成されます。詳細は[他の拡張機能との合成](#他の拡張機能との合成)を参照してください。
 - 全パラメータの XYZ Grid 軸を提供。
 - 生成パラメータを PNG infotext に埋め込み、再現可能です。
 
@@ -345,14 +359,27 @@ Momentum の既定値は `0`（オフ）です。この状態では APG は完�
 
 ## 他の拡張機能との合成
 
-`sorting_priority = 14.5` により、APG は pre-CFG チェーンの最後に配置されます。
+チェーン内の実行順序は、優先度挿入（`core.py` の `_priority_insert_pre_cfg` /
+`_priority_insert_post_cfg`）によって決まります。`sorting_priority` ではありません。
+`sorting_priority` は本拡張機能のアコーディオンが UI 上のどこに描画されるかのみを制御します。
+APG は優先度 14.5 で登録されます。
 
 ```
 TCFG (13.0) → SkimmedCFG (14.0) → DifferenceCFG (14.2) → APG (14.5)
-    → CFG → CFGZeroStar (15.0) → MaHiRo (15.5)
+    → CFG → CFGZeroStar (15.0) → FreSca (15.2) → MaHiRo (15.5)
+    → CFGNorm (16.0) → CFGRegulator (16.5)
 ```
 
 これは APG に推奨される「CFG 直前の最終調整」という役割に一致します。
+
+起動前に `SD_WEBUI_SETI_DEBUG=1` を設定すると、サンプリング時に組み立てられた
+チェーンが出力されます。
+
+```
+[APG] pre-CFG chain: _tcfg_pre_cfg_fn(13.0) -> ... -> _apg_pre_cfg_fn(14.5)
+```
+
+出力された順序が上記と異なる場合、チェーン内のいずれかが優先度挿入に参加していません。
 
 Forge Neo では、同一の post-CFG 呼び出し内で TCFG が先に実行されていた場合、共有の `model_options` から TCFG の減衰済み uncond を読み取ります。
 
