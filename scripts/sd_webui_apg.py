@@ -1,5 +1,5 @@
 """
-sd-webui-APG — Adaptive Projected Guidance for Forge-derived WebUIs
+sd-webui-APG - Adaptive Projected Guidance for Forge-derived WebUIs
 ====================================================================
 Location: extensions/sd-webui-APG/scripts/sd_webui_apg.py
 
@@ -57,7 +57,7 @@ import gradio as gr
 from modules import scripts, script_callbacks
 
 # ---------------------------------------------------------------------------
-# sys.path — ensure the extension root is importable
+# sys.path - ensure the extension root is importable
 # ---------------------------------------------------------------------------
 _EXT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _EXT_ROOT not in sys.path:
