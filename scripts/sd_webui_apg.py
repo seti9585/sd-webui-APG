@@ -7,9 +7,17 @@ Hook:  Pre-CFG (reForge / Forge Classic) / Post-CFG (Forge Neo)
 Paper: "Eliminating Oversaturation and Artifacts of High Guidance Scales in
         Diffusion Models" (arXiv:2410.02416, ICLR 2025)
 
-sorting_priority: 14.5
+_sd_webui_priority: 14.5
+    Execution order in the pre-CFG / post-CFG chain is decided by priority
+    insertion (see _priority_insert_pre_cfg / _priority_insert_post_cfg in
+    core.py), not by sorting_priority below, which only controls where this
+    extension's accordion is drawn in the UI. Suite order:
     TCFG (13.0) -> SkimmedCFG (14.0) -> DifferenceCFG (14.2) -> APG (14.5)
-    -> CFG -> CFGZeroStar (15.0) -> MaHiRo (15.5)
+    -> CFG -> CFGZeroStar (15.0) -> FreSca (15.2) -> MaHiRo (15.5)
+    -> CFGNorm (16.0) -> CFGRegulator (16.5)
+
+    Set SD_WEBUI_SETI_DEBUG=1 to have the assembled chain printed at
+    sampling time.
 
 APG decomposes the guidance vector (cond - uncond) into components parallel
 and orthogonal to the conditional prediction. The parallel component is the
@@ -24,8 +32,12 @@ Defaults follow the paper: eta = 0.0 (recommended default), norm_threshold =
 buffer carries state across model evaluations and is not recommended with
 high-order solvers -- see core.py).
 
-Neutral settings that reproduce standard CFG exactly (fixed-seed A/B
-baseline): eta = 1.0, norm_threshold = 0.0, momentum = 0.0.
+Neutral settings (eta = 1.0, norm_threshold = 0.0, momentum = 0.0) reduce
+to standard CFG algebraically, not bitwise: the projection round-trips
+through double precision, and on a real sampling run this measured as a
+mean absolute RGB difference of about 0.74 against a disabled run (SDXL,
+kutta4, 35 steps, CFG 7, fixed seed). Disable the extension for a bitwise
+A/B baseline; do not neutralise it. See README.md for the figures.
 
 Inspiration:
     The author first learned of APG through note.com articles by
@@ -80,6 +92,8 @@ def _build_infotext_params(cfg: dict) -> dict:
 
 class APGScript(scripts.Script):
 
+    # UI accordion position only. Execution order is decided separately by
+    # _sd_webui_priority = 14.5 and priority insertion in core.py.
     sorting_priority = 14.5
 
     def __init__(self):
@@ -117,13 +131,15 @@ class APGScript(scripts.Script):
             )
             gr.HTML(
                 "<p style='color:gray;font-size:0.9em;'>"
-                "Neutral settings (identical to standard CFG): Eta 1.0, "
-                "Norm Threshold 0, Momentum 0. Momentum accumulates across "
-                "model evaluations and therefore breaks the stateless "
-                "assumption of ODE samplers: with multi-stage or adaptive "
-                "solvers (TDE Sampler / RK Sampler, Heun, DPM++ 2M/3M) the "
-                "value no longer maps to the result in a predictable way. "
-                "Not recommended above single-stage samplers; OFF by default."
+                "Neutral settings (Eta 1.0, Norm Threshold 0, Momentum 0) "
+                "reduce to standard CFG algebraically, not bitwise -- "
+                "disable the extension instead for a bitwise A/B baseline. "
+                "Momentum accumulates across model evaluations and "
+                "therefore breaks the stateless assumption of ODE "
+                "samplers: with multi-stage or adaptive solvers (TDE "
+                "Sampler / RK Sampler, Heun, DPM++ 2M/3M) the value no "
+                "longer maps to the result in a predictable way. Not "
+                "recommended above single-stage samplers; OFF by default."
                 "</p>"
             )
 
