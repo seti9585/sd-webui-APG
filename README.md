@@ -137,9 +137,9 @@ so the accuracy you are paying extra model evaluations for is lost.
 
 | Sampler | Momentum |
 |---|---|
-| Euler, LMS, and other single-stage methods | Usable |
-| Heun, DPM++ 2M / 3M, and other multi-stage methods | Not recommended |
-| TDE Sampler / RK Sampler (multi-stage or adaptive solvers) | Not recommended |
+| Euler, Euler a, and other single-stage methods | Usable |
+| Heun, DPM2, DPM++ 2S a, DPM++ SDE, Restart, and other multi-stage methods | Not recommended |
+| DPM adaptive and other adaptive-step solvers | Not recommended |
 
 Momentum defaults to `0` (off), which keeps APG a purely stateless
 per-evaluation transform and safe to combine with any sampler.
@@ -349,9 +349,9 @@ momentum バッファは**モデル評価をまたいで**移動平均を保持�
 
 | サンプラー | Momentum |
 |---|---|
-| Euler、LMS その他の単段法 | 使用可 |
-| Heun、DPM++ 2M / 3M その他の多段法 | 非推奨 |
-| TDE Sampler / RK Sampler（多段・可変ステップソルバー） | 非推奨 |
+| Euler、Euler a その他の単段法 | 使用可 |
+| Heun、DPM2、DPM++ 2S a、DPM++ SDE、Restart その他の多段法 | 非推奨 |
+| DPM adaptive その他の可変ステップソルバー | 非推奨 |
 
 Momentum の既定値は `0`（オフ）です。この状態では APG は完全に無状態な評価ごとの変換であり、どのサンプラーと組み合わせても安全です。
 
