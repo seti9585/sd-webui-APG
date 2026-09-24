@@ -77,8 +77,8 @@ Momentum and ODE samplers:
     amplification.
 
     Practical consequence: momentum is not recommended together with
-    high-order solvers (TDE Sampler / RK Sampler multi-stage methods,
-    Heun, DPM++ 2M/3M and similar). Momentum defaults to OFF, which keeps
+    multi-stage or adaptive solvers (e.g. Heun, DPM2, DPM++ 2S a,
+    DPM++ SDE, DPM adaptive, Restart). Momentum defaults to OFF, which keeps
     APG a pure stateless per-evaluation transform; the slider remains
     available for single-stage samplers.
 
