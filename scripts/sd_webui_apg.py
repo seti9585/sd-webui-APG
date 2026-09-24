@@ -136,10 +136,12 @@ class APGScript(scripts.Script):
                 "disable the extension instead for a bitwise A/B baseline. "
                 "Momentum accumulates across model evaluations and "
                 "therefore breaks the stateless assumption of ODE "
-                "samplers: with multi-stage or adaptive solvers (TDE "
-                "Sampler / RK Sampler, Heun, DPM++ 2M/3M) the value no "
-                "longer maps to the result in a predictable way. Not "
-                "recommended above single-stage samplers; OFF by default."
+                "samplers: with multi-stage or adaptive solvers (e.g. "
+                "Heun, DPM2, DPM++ 2S a, DPM++ SDE, DPM adaptive, "
+                "Restart) the value no longer maps to the result in a "
+                "predictable way. Not recommended for anything other "
+                "than single-stage samplers such as Euler / Euler a; "
+                "OFF by default."
                 "</p>"
             )
 
