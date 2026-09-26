@@ -1,5 +1,5 @@
 """
-core.py — Adaptive Projected Guidance (APG) algorithm
+core.py - Adaptive Projected Guidance (APG) algorithm
 ======================================================
 Location: extensions/sd-webui-APG/sd_webui_apg/core.py
 
@@ -48,39 +48,29 @@ Defaults (paper-derived):
                            is desired."
     norm_threshold = 15.0  Paper Table 10, the Stable Diffusion XL row (r=15).
     momentum       = 0.0   Paper Algorithm 1 signature default (buffer=None).
-                           Table 10 uses beta=-0.5 for SDXL. See the momentum
-                           section below for why this port defaults it OFF.
+                           Table 10 uses beta=-0.5 for SDXL. Kept OFF by
+                           default so the transform stays stateless.
 
 Momentum and ODE samplers:
-    The momentum buffer carries state across model EVALUATIONS, which breaks
-    the stateless right-hand-side assumption of ODE samplers. Multi-stage
-    solvers (fe_kutta4 = 4 evaluations per step) and adaptive step control
-    (a rejected step is re-evaluated) change how fast the buffer accumulates,
-    so the same beta behaves differently per sampler and per rtol/atol
-    setting.
+    The momentum buffer carries state across model EVALUATIONS, not solver
+    steps, so the guidance is no longer a function of (x, sigma) alone.
+    Fixed-seed measurements on reForge (SDXL, 35 steps, Align Your Steps,
+    CFG 7, Eta 1.0, Norm Threshold 15) showed:
 
-    Fixed-seed A/B measurements (SDXL, 35 steps, Align Your Steps, CFG 7,
-    beta = -0.15) showed that this is not merely a scaling difference:
+      * With kutta4, beta = -0.1 ... -0.5 moved the result by a steadily
+        growing amount (mean absolute RGB difference 2.3 -> 5.6 against
+        beta = 0). The value maps to the result monotonically.
+      * The same beta acts more strongly on a single-stage solver: at
+        beta = -0.15, euler changed by about 1.8 times as much as kutta4.
+        Re-tune beta when the sampler changes.
+      * beta = -1.0 does not converge (past values never decay) and the
+        image collapses into a flat, grey result. Keep |beta| below 1.
 
-      * With a single-stage solver (euler), varying an early-decay parameter
-        produced changes of roughly half the magnitude seen with a 4-stage
-        solver (kutta4) under identical settings.
-      * With kutta4, a parameter change of 0.01 moved the result about as far
-        as the result was from the baseline in the first place -- i.e. the
-        output jumped to an unrelated solution rather than changing by a
-        proportional amount.
-
-    Interpretation: once momentum is enabled the integrand is no longer a
-    function of (x, sigma) alone, so a high-order solver's intermediate
-    stages no longer improve the estimate; they amplify small early
-    perturbations instead. The higher the order, the stronger the
-    amplification.
-
-    Practical consequence: momentum is not recommended together with
-    multi-stage or adaptive solvers (e.g. Heun, DPM2, DPM++ 2S a,
-    DPM++ SDE, DPM adaptive, Restart). Momentum defaults to OFF, which keeps
-    APG a pure stateless per-evaluation transform; the slider remains
-    available for single-stage samplers.
+    An earlier release documented momentum as unpredictable with
+    multi-stage solvers. That measurement was taken with the since-removed
+    Adaptive Momentum option and does not apply to plain momentum.
+    Adaptive-step solvers re-evaluate rejected steps, so the effective
+    strength also depends on their tolerance settings.
 
 Momentum reset:
     A fresh closure (and thus a fresh MomentumBuffer) is created per sampling
@@ -90,28 +80,48 @@ Momentum reset:
     larger sigma, and the per-pass closure already covers the case it was
     meant to catch.
 
-Backend-adaptive hooking (same pattern as sd-webui-DifferenceCFG / TCFG):
-    * reForge / Forge Classic -> Pre-CFG (dict args, "conds_out" style).
-      Write-back trick: overwriting the uncond slot with (cond - update)
-      makes the subsequent standard CFG step
-          out = uncond' + cond_scale * (cond - uncond')
-              = cond + (cond_scale - 1) * update
-      reproduce the paper formula for ANY cond_scale (no scale dependence in
-      the write-back itself).
-    * Forge Neo               -> Post-CFG (dict args, "denoised" style);
-      the final prediction is recomputed directly as
-          cond + (cond_scale - 1) * update.
+Hooking (v3.0: post-CFG on every backend):
+    APG is registered in sampler_post_cfg_function on reForge / Forge
+    Classic AND on Forge Neo, and works on the chained prediction
+    args["denoised"] instead of the raw cond/uncond pair:
 
-Composition with the SETI suite:
-    sorting_priority 14.5 places APG last in the pre-CFG chain --
-    TCFG (13.0) -> SkimmedCFG (14.0) -> DifferenceCFG (14.2) -> APG (14.5)
-    -> CFG -> CFGZeroStar (15.0) -> MaHiRo (15.5) -- matching the
-    "final polish before CFG" role recommended for APG.
-    On Forge Neo, TCFG's damped uncond is read from
-    model_options["_tcfg_damped_uncond"] when present (same known limitation
-    as DifferenceCFG: Forge Neo hands every post-CFG hook the raw cond/uncond, so
-    modifications by other post-CFG extensions that do not stash their state
-    are not visible here).
+        G        = denoised - cond          (guidance the chain produced;
+                                             already carries (s - 1))
+        diff_eff = G / (s - 1)              (s = cond_scale, s > 1 only)
+        update   = APG(diff_eff)            (momentum -> clamp -> projection)
+        out      = cond + (s - 1) * update
+
+    With no earlier post-CFG hook, denoised = uncond + s * (cond - uncond),
+    so diff_eff = cond - uncond and the result is algebraically identical
+    to the paper formula (and to the pre-CFG write-back used up to v2.x). On
+    reForge, pre-CFG extensions (TCFG / SkimmedCFG / DifferenceCFG) are
+    already folded into denoised and into cond_denoised, so they are
+    preserved as before. The same formula now runs on both backends.
+
+Composition with the SETI suite (v3.0):
+    _PRIORITY = 15.4 places APG after FreSca and before MaHiRo:
+    CFGZeroStar (15.0) -> FreSca (15.2) -> APG (15.4) -> MaHiRo (15.5)
+    -> CFGNorm (16.0) -> CFGRegulator (16.5)
+    Rationale: FreSca's frequency rescaling can create components parallel
+    to cond, which APG should see; MaHiRo is the final guidance decision
+    layer and must run after APG (APG after MaHiRo would erase MaHiRo's
+    positive leap entirely).
+
+    Behaviour change versus v2.x on reForge: MaHiRo, FreSca and
+    CFGZeroStar read args["uncond_denoised"]. v2.x rewrote that slot to the
+    synthetic uncond (cond - update) in pre-CFG; v3.0 leaves it as the
+    TCFG / SkimmedCFG / DifferenceCFG adjusted uncond. Images generated
+    with the same seed and settings therefore differ from v2.x. Fixed-seed
+    comparison (SDXL, CFG 15, TCFG + APG Eta 0.5 + MaHiRo) showed the same
+    saturation level in both versions, while FreSca's settings now carry
+    through to the result as intended (with v2.x, lowering FreSca's
+    high-frequency scale had almost no effect once MaHiRo was on).
+
+    On Forge Neo, APG now also receives the SkimmedCFG / DifferenceCFG
+    result through args["denoised"] instead of overwriting it.
+
+    Zero-init: when an earlier hook (CFGZeroStar zero-init) returns an
+    all-zero prediction, APG passes it through unchanged.
 """
 
 import logging
@@ -125,9 +135,9 @@ logger = logging.getLogger(__name__)
 MARKER = "sd_webui_apg_v1"
 
 # Mirrors APGScript.sorting_priority in scripts/sd_webui_apg.py. Kept in sync
-# manually; used only to order this extension's hook within Forge Neo's
+# manually; used to order this extension's hook within the
 # sampler_post_cfg_function list relative to other SETI extensions.
-_PRIORITY = 14.5
+_PRIORITY = 15.4
 
 # Suite-wide debug convention: 0 = off, 1 = apply-time settings + chain dump.
 DEBUG_ENV_VAR = "SD_WEBUI_SETI_DEBUG"
@@ -233,57 +243,6 @@ def _priority_insert_post_cfg(unet, fn) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Priority-ordered insertion for the reForge / Forge Classic pre-cfg list
-# ---------------------------------------------------------------------------
-
-def _priority_insert_pre_cfg(unet, fn, disable_cfg1_optimization: bool = False) -> None:
-    """
-    Twin of _priority_insert_post_cfg for the pre-CFG list. Identical
-    semantics, different key.
-
-    Replaces the plain append that set_model_sampler_pre_cfg_function
-    performs. That append made execution order depend on extension load
-    order rather than on _sd_webui_priority, so the documented chain
-    TCFG (13.0) -> SkimmedCFG (14.0) -> DifferenceCFG (14.2) -> APG (14.5)
-    was not actually enforced on reForge. Forge Neo was already correct
-    because that path used _priority_insert_post_cfg.
-
-    disable_cfg1_optimization mirrors the flag that
-    set_model_sampler_pre_cfg_function sets, so callers relying on it keep
-    working.
-
-    A new list is built rather than mutating in place, matching the backend
-    helper's semantics, so a cloned unet never leaks the change into its
-    source. Duplicated deliberately: each extension carries its own copy so
-    no cross-extension import dependency exists.
-    """
-    key = "sampler_pre_cfg_function"
-    existing = unet.model_options.get(key, [])
-    priority = fn._sd_webui_priority
-
-    insert_at = len(existing)
-    for i, other in enumerate(existing):
-        other_priority = getattr(other, "_sd_webui_priority", None)
-        if other_priority is not None and other_priority > priority:
-            insert_at = i
-            break
-
-    unet.model_options[key] = existing[:insert_at] + [fn] + existing[insert_at:]
-
-    if disable_cfg1_optimization:
-        unet.model_options["disable_cfg1_optimization"] = True
-
-
-def _stashed_tcfg_uncond(args: dict):
-    """Return TCFG's damped uncond from model_options if TCFG ran earlier in
-    this same post-cfg call, else None."""
-    model_options = args.get("model_options")
-    if not isinstance(model_options, dict):
-        return None
-    return model_options.get("_tcfg_damped_uncond")
-
-
-# ---------------------------------------------------------------------------
 # APG core math (paper Algorithm 1)
 # ---------------------------------------------------------------------------
 
@@ -348,8 +307,7 @@ def _apg_update(
     The momentum stage is skipped entirely when the coefficient is 0 so that
     the default configuration stays a stateless per-evaluation transform.
 
-    The final combination with cond_scale is done by the caller (it differs
-    between the pre-CFG write-back and the post-CFG direct recomputation).
+    The final combination with cond_scale is done by the caller.
     """
     diff = cond - uncond
 
@@ -373,91 +331,32 @@ def _apg_update(
 
 
 # ---------------------------------------------------------------------------
-# Pre-CFG chain observability
+# Post-CFG chain observability
 # ---------------------------------------------------------------------------
 
 def _maybe_dump_chain(args) -> None:
-    """Emit the pre-CFG chain once per pass, from inside the hook, so what is
-    printed is the list as the sampler actually holds it at call time. The
-    suite's post-CFG dump (sd-webui-FreSca) reads sampler_post_cfg_function
-    and cannot see this list."""
+    """Emit the post-CFG chain once per pass, from inside the hook, so what
+    is printed is the list as the sampler actually holds it at call time."""
     global _CHAIN_DUMPED
     if _CHAIN_DUMPED or _debug_level() < 1:
         return
     _CHAIN_DUMPED = True
     try:
         opts = args.get("model_options") or {}
-        _emit(1, "pre-CFG chain: %s",
-              _describe_chain(opts.get("sampler_pre_cfg_function")))
+        _emit(1, "post-CFG chain: %s",
+              _describe_chain(opts.get("sampler_post_cfg_function")))
     except Exception as exc:
-        _emit(1, "pre-CFG chain dump failed: %r", exc)
+        _emit(1, "post-CFG chain dump failed: %r", exc)
 
 
 # ---------------------------------------------------------------------------
-# Pre-CFG factory (reForge / Forge Classic)
+# Post-CFG factory (all backends)
 # ---------------------------------------------------------------------------
-# reForge pre-CFG args dict keys used here:
-#   "conds_out"  — [cond, uncond] denoised predictions (uncond may be absent
-#                  or all-zero when CFG == 1)
-#   "cond_scale" — CFG scale (not needed by the write-back; it is
-#                  scale-independent)
-# ---------------------------------------------------------------------------
-
-def _make_apg_pre_fn(
-    eta: float,
-    norm_threshold: float,
-    momentum: float,
-):
-    """APG — Pre-CFG (reForge / Forge Classic).
-
-    Write-back trick: overwriting conds_out[1] with (cond - update) makes the
-    backend's standard CFG combination produce the paper output
-    cond + (cond_scale - 1) * update for any cond_scale.
-    """
-    buffer = MomentumBuffer(momentum)
-
-    @torch.no_grad()
-    def _fn(args):
-        conds_out = args["conds_out"]
-        try:
-            if conds_out is None or len(conds_out) < 2:
-                return conds_out
-            if conds_out[1] is None or not torch.any(conds_out[1]):
-                # CFG == 1 optimization: no usable uncond; nothing to do.
-                return conds_out
-
-            cond = conds_out[0]
-            uncond = conds_out[1]
-
-            _maybe_dump_chain(args)
-
-            update = _apg_update(cond, uncond, buffer, eta, norm_threshold)
-            conds_out[1] = cond - update
-            return conds_out
-        except Exception:
-            logger.exception("[APG] pre-CFG function failed; passing through")
-            return conds_out
-
-    # Factory-made closures are all called "_fn"; give them a stable name so
-    # the chain dump is readable.
-    _fn.__name__ = "_apg_pre_cfg_fn"
-    _fn._sd_webui_apg_marker = MARKER
-    # Ordering tag read by _priority_insert_pre_cfg. Previously only the
-    # Forge Neo post-CFG factory carried this, so the reForge pre-CFG hook
-    # was invisible to priority-based insertion.
-    _fn._sd_webui_priority = _PRIORITY
-    return _fn
-
-
-# ---------------------------------------------------------------------------
-# Post-CFG factory (Forge Neo)
-# ---------------------------------------------------------------------------
-# Forge Neo post-CFG args dict keys used here:
-#   "denoised"        — current CFG result (returned unchanged on early exit)
-#   "cond_denoised"   — positive prediction
-#   "uncond_denoised" — negative prediction (None when CFG == 1 / uncond off)
-#   "cond_scale"      — CFG scale
-#   "model_options"   — shared dict; read for TCFG's stashed damped uncond
+# Post-CFG args dict keys used here (same on reForge and Forge Neo):
+#   "denoised"        - prediction produced by the chain so far (anchor)
+#   "cond_denoised"   - positive prediction (on reForge: after pre-CFG hooks)
+#   "uncond_denoised" - only checked for presence (None / zero = no CFG)
+#   "cond_scale"      - CFG scale
 # ---------------------------------------------------------------------------
 
 def _make_apg_post_fn(
@@ -465,32 +364,54 @@ def _make_apg_post_fn(
     norm_threshold: float,
     momentum: float,
 ):
-    """APG — Post-CFG (Forge Neo).
+    """APG - Post-CFG, chain-respecting (v3.0).
 
-    Recomputes the final prediction directly with the paper formula
-    cond + (cond_scale - 1) * update. Early returns hand back
-    args["denoised"] unchanged.
+    Recovers the guidance vector from the chained prediction, applies the
+    paper's APG update to it and rebuilds the output around cond. Every
+    early exit returns args["denoised"] unchanged so earlier hooks survive.
     """
     buffer = MomentumBuffer(momentum)
 
     @torch.no_grad()
     def _fn(args):
+        denoised = args["denoised"]
         try:
+            _maybe_dump_chain(args)
+
             uncond_denoised = args.get("uncond_denoised")
             if uncond_denoised is None or not torch.any(uncond_denoised):
-                return args["denoised"]
+                # CFG == 1 optimization / uncond skipped: nothing to reshape.
+                return denoised
 
-            cond_scale = args["cond_scale"]
+            cond = args.get("cond_denoised")
+            if cond is None or denoised is None:
+                return denoised
 
-            cond = args["cond_denoised"]
-            tcfg_uncond = _stashed_tcfg_uncond(args)
-            uncond = tcfg_uncond if tcfg_uncond is not None else uncond_denoised
+            s = float(args["cond_scale"])
+            if s <= 1.0:
+                # (s - 1) is the divisor below; no guidance to reshape.
+                return denoised
 
-            update = _apg_update(cond, uncond, buffer, eta, norm_threshold)
-            return cond + (cond_scale - 1.0) * update
+            if not torch.any(denoised):
+                # An earlier hook zeroed the prediction on purpose
+                # (CFGZeroStar zero-init). Keep it zero.
+                return denoised
+
+            # Guidance actually produced by the chain, divided back to the
+            # paper's (cond - uncond) scale so norm_threshold keeps its
+            # meaning. Done in fp32: the operands are close in magnitude.
+            orig_dtype = denoised.dtype
+            cond_f = cond.float()
+            diff_eff = (denoised.float() - cond_f) / (s - 1.0)
+
+            # _apg_update computes cond - uncond internally, so pass an
+            # uncond that reproduces diff_eff exactly.
+            update = _apg_update(cond_f, cond_f - diff_eff, buffer,
+                                 eta, norm_threshold)
+            return (cond_f + (s - 1.0) * update).to(orig_dtype)
         except Exception:
             logger.exception("[APG] post-CFG function failed; passing through")
-            return args["denoised"]
+            return denoised
 
     _fn.__name__ = "_apg_post_cfg_fn"
     _fn._sd_webui_apg_marker = MARKER
@@ -524,12 +445,11 @@ def apply_apg(
     norm_threshold: float,
     momentum: float,
 ):
-    """Register APG on unet, choosing the correct hook for the backend.
+    """Register APG on unet as a post-CFG hook (all backends, v3.0).
 
-      * Forge Neo               -> Post-CFG, priority-ordered so it runs after
-                                    TCFG / SkimmedCFG / DifferenceCFG and
-                                    before CFGZeroStar / MaHiRo.
-      * reForge / Forge Classic -> Pre-CFG.
+    Inserted by priority (15.4): after CFGZeroStar / FreSca, before MaHiRo /
+    CFGNorm / CFGRegulator. Any APG hook left in the pre-CFG list by an
+    older version is removed first.
 
     A fresh closure (and momentum buffer) is created on every call, so
     invoking this from process_before_every_sampling() resets momentum for
@@ -541,8 +461,7 @@ def apply_apg(
                        off)
       norm_threshold : per-sample L2 clamp on the guidance vector
                        (0 disables; paper Table 10 uses 15.0 for SDXL)
-      momentum       : running-average coefficient (0 disables; the paper's
-                       experiments use negative values such as -0.5). Not
+      momentum       : running-average coefficient (0 disables). Not
                        recommended with high-order solvers -- see the module
                        docstring.
     """
@@ -556,21 +475,12 @@ def apply_apg(
         eta, norm_threshold, momentum,
     )
 
-    if _is_forge_neo_backend():
-        _priority_insert_post_cfg(
-            unet,
-            _make_apg_post_fn(eta, norm_threshold, momentum),
-        )
-        logger.debug("[APG] registered post-CFG hook (Forge Neo backend)")
-    else:
-        # v1.1: priority-ordered insertion replaces the plain append that
-        # set_model_sampler_pre_cfg_function performs. See
-        # _priority_insert_pre_cfg for why.
-        _priority_insert_pre_cfg(
-            unet,
-            _make_apg_pre_fn(eta, norm_threshold, momentum),
-        )
-        _emit(1, "registered pre-CFG hook (reForge / Forge Classic), "
-                 "priority=%s", _PRIORITY)
+    _priority_insert_post_cfg(
+        unet,
+        _make_apg_post_fn(eta, norm_threshold, momentum),
+    )
+    _emit(1, "registered post-CFG hook (%s backend), priority=%s",
+          "Forge Neo" if _is_forge_neo_backend() else "reForge / Forge Classic",
+          _PRIORITY)
 
     return unet
