@@ -73,6 +73,16 @@ def _has_forge_backend(p) -> bool:
     return hasattr(p, "sd_model") and hasattr(p.sd_model, "forge_objects")
 
 
+# Every infotext key this extension writes (including the removed Adaptive
+# Momentum key, so stale values from older releases are cleared as well).
+_INFOTEXT_KEYS = (
+    "APG Eta",
+    "APG Norm Threshold",
+    "APG Momentum",
+    "APG Adaptive Momentum",
+)
+
+
 def _build_infotext_params(cfg: dict) -> dict:
     """Build the infotext key/value dict.
 
@@ -196,6 +206,12 @@ class APGScript(scripts.Script):
     # ------------------------------------------------------------------
 
     def process(self, p, *args):
+        # XYZ Grid shallow-copies p for every cell, so extra_generation_params
+        # is one dict shared by all cells. Remove this extension's keys first;
+        # otherwise a disabled cell inherits the keys an earlier enabled cell
+        # wrote, and its infotext wrongly claims APG was on.
+        for key in _INFOTEXT_KEYS:
+            p.extra_generation_params.pop(key, None)
         cfg = self._resolve(p, args)
         if cfg is None or not cfg["enabled"]:
             return
@@ -241,9 +257,11 @@ class APGScript(scripts.Script):
 # ---------------------------------------------------------------------------
 
 def _set_xyz(p, x: Any, xs: Any, *, field: str) -> None:
-    if not hasattr(p, "_apg_xyz"):
-        p._apg_xyz = {}
-    p._apg_xyz[field] = x
+    # Build a new dict instead of mutating one that may be shared with other
+    # grid cells through XYZ Grid's shallow copy of p.
+    overrides = dict(getattr(p, "_apg_xyz", {}) or {})
+    overrides[field] = x
+    p._apg_xyz = overrides
 
 
 def _register_xyz() -> None:
